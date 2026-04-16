@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>Slideshow generation with mediabunny</title>
+</head>
+
+<body>
+  <h2>Slideshow generation with mediabunny</h2>
+<label>Photo:</label><br/>
+ <input type="file" id="pics" accept=".jpg,.jpeg,.png,.webp,.gif,.bmp" multiple>
+  <br><br>
+ <label>Audio:</label><br/>
+ <input id="audioInput" type="file" accept=".mp3,.wav,.m4a,.ogg,.flac" />
+ <br><br>
+ <button id="make">START</button>
+ <br><br>
+ <div id="status">Idle</div>
+ <br><br>
+ <video id="previewVideo" controls width="100%" style="display:none; margin-top:20px;"></video>
+ <canvas id="canvas" width="800" height="450" style="visibility:hidden; margin-top:20px;"></canvas>
+
+<script type="module">
+
+// mediabunny video encoder example.
+// used in this example:
+//mediabunny
+//aac-encoder (for converting audio to AAC when on Linux)
+//webcodecs (via media bunny)
+//audioContext (to convert audio to required format for audiobunny)
+
+
+    import {
+      Input,
+      BlobSource,
+      ALL_FORMATS,
+      Output,
+      BufferTarget,
+      Mp4OutputFormat,
+      CanvasSource,
+      AudioBufferSource,
+      canEncodeAudio,
+      Conversion,
+    } from 'https://cdn.jsdelivr.net/npm/mediabunny@1.40.1/+esm';
+
+    import { registerAacEncoder } from 'https://cdn.jsdelivr.net/npm/@mediabunny/aac-encoder@1.40.1/+esm'
+
+    let check = false;
+    if (!(await canEncodeAudio("aac"))) {
+      console.warn("AAC encoding not supported natively, registering WASM fallback.");
+      registerAacEncoder();
+      check = true;
+    }
+
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const statusDiv = document.getElementById("status");
+    const makeBtn = document.getElementById("make");
+    const picsInput = document.getElementById("pics");
+    const audioInput = document.getElementById('audioInput');
+
+    async function loadImage(file) {
+      return new Promise((resolve) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          URL.revokeObjectURL(url);
+          resolve(img);
+        };
+        img.src = url;
+      });
+    }
+
+    makeBtn.onclick = async () => {
+      const imageFiles = [...picsInput.files];
+      const audioFiles = [...audioInput.files];
+
+      const MAX_IMAGES = 10;
+      const MAX_AUDIO = 1;
+      const fps = 30
+
+      if (imageFiles.length === 0) { alert("Please select at least one image."); return; }
+      if (imageFiles.length > MAX_IMAGES) { alert(`You selected ${imageFiles.length} images. Maximum allowed is ${MAX_IMAGES}.`); return; }
+      if (audioFiles.length > MAX_AUDIO) { alert(`You selected ${audioFiles.length} audio files. Maximum allowed is ${MAX_AUDIO}.`); return; }
+
+      const isLinux = navigator.userAgent.includes("Linux");
+
+      statusDiv.textContent = "Loading images...";
+
+      const images = [];
+
+      for (const f of imageFiles) {
+        images.push(await loadImage(f));
+      }
+
+      let currentImg = await loadImage(imageFiles[0]);
+
+      statusDiv.textContent = "Starting encoder...";
+
+      const output = new Output({
+        format: new Mp4OutputFormat(),
+        target: new BufferTarget(),
+      });
+
+      const videoSource = new CanvasSource(canvas, {
+        fps: fps,
+        codec: "avc",
+        bitrate: 6_000_000, //  Mbps
+        bitrateMode: 'constant'
+      });
+
+      output.addVideoTrack(videoSource, { frameRate: fps });
+
+      let audioSource;
+
+      if (isLinux) {
+        console.log("Linux detected changing audio to Opus.");
+
+        audioSource = new AudioBufferSource({
+          codec: "opus",
+          bitrate: 96_000,
+
+        });
+
+      } else {
+
+        audioSource = new AudioBufferSource({
+          codec: "aac",
+          bitrate: 96_000,
+
+        });
+      }
+      output.addAudioTrack(audioSource);
+      await output.start();
+
+      statusDiv.textContent = "Generating Video...";
+
+      let totalFramesDrawn = 0;
+      const secondsPerImage = 6; 
+      const framesPerImage = secondsPerImage * fps;
+
+      let frameIndex = 0;
+
+      for (let i = 0; i < images.length; i++) {
+        const img = images[i];
+
+        for (let j = 0; j < framesPerImage; j++) {
+
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+         
+          const timestamp = frameIndex / fps;
+          frameIndex++;
+          
+          await videoSource.add(timestamp, 1 / fps);
+          totalFramesDrawn++;
+        }
+
+        statusDiv.textContent = `Processing image ${i + 1} / ${imageFiles.length}`;
+      }
+
+      console.log('Total frames drawn:', totalFramesDrawn);
+
+      videoSource.close();
+
+      statusDiv.textContent = "Generating Audio...";
+      // GEN AUDIO
+      const audioCtx = new AudioContext();
+
+      async function decodeAudioFile(file, audioCtx) {
+        const arrayBuffer = await file.arrayBuffer();
+        return await audioCtx.decodeAudioData(arrayBuffer);
+      }
+
+      for (const file of audioFiles) {
+        const decoded = await decodeAudioFile(file, audioCtx);
+        await audioSource.add(decoded);
+
+      }
+
+      audioSource.close();
+
+      
+
+      await output.finalize();
+
+      let blob = new Blob([output.target.buffer], { type: "video/mp4" });
+
+      if (check == true) {
+
+        const input = new Input({
+          source: new BlobSource(blob),
+          formats: ALL_FORMATS,
+        });
+
+        const output3 = new Output({
+          format: new Mp4OutputFormat(),
+          target: new BufferTarget(),
+        });
+        statusDiv.textContent = "Converting audio to AAC, this might take a few miniutes...";
+       
+        const conversion = await Conversion.init({
+          input: input,
+          output: output3,
+          audio: {
+            codec: 'aac',
+            bitrate: 128000, // 128 kbps
+            sampleRate: 44100, // 44.1 kHz
+            channels: 2, // Stereo
+            forceTranscode: true,
+          },
+        });
+         
+        await conversion.execute();
+        statusDiv.textContent = "Finalizing Video...";
+
+        blob = new Blob([output3.target.buffer], { type: "video/mp4" });
+
+      } else {
+        statusDiv.textContent = "Finalizing Video...";
+      }
+       
+      statusDiv.textContent = "Video Complete!...";
+      const url = URL.createObjectURL(blob);
+
+      // LOAD COMPLETED VIDEO
+      const videoEl = document.getElementById("previewVideo");
+      videoEl.src = url;
+
+      // SHOW PLAYER
+      videoEl.style.display = "block";
+
+
+      videoEl.load();
+      videoEl.play();
+  
+    };
+
+
+  </script>
+
+</body>
+
+</html>
